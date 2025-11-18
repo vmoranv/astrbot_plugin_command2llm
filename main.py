@@ -1,59 +1,21 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.platform import AstrBotMessage, MessageMember
 from astrbot.api.message_components import Plain
-import asyncio
-import json
-import re
+from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.agent.tool import FunctionTool, ToolExecResult, ToolSet
+from astrbot.core.astr_agent_context import AstrAgentContext
+from astrbot.core.config import AstrBotConfig
+from astrbot.core.star.star_handler import star_handlers_registry
+from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.command_group import CommandGroupFilter
 from difflib import SequenceMatcher
 import uuid
 import inspect
 
-# 重新导入agent相关模块
-try:
-    from astrbot.core.agent.run_context import ContextWrapper
-    from astrbot.core.agent.tool import FunctionTool, ToolExecResult, ToolSet
-    from astrbot.core.astr_agent_context import AstrAgentContext
-    from pydantic import Field
-    from pydantic.dataclasses import dataclass
-    from astrbot.core.config import AstrBotConfig
-    AGENT_AVAILABLE = True
-except ImportError:
-    logger.warning("Agent模块不可用，使用备用实现")
-    AGENT_AVAILABLE = False
-
-
-
-# 尝试导入star相关模块
-try:
-    from astrbot.core.star.star_handler import star_handlers_registry
-    from astrbot.core.star.star import star_map
-    from astrbot.core.star.filter.command import CommandFilter
-    from astrbot.core.star.filter.command_group import CommandGroupFilter
-    from astrbot.core.star.filter.regex import RegexFilter
-    from astrbot.core.star.filter.permission import PermissionTypeFilter
-    STAR_AVAILABLE = True
-except ImportError:
-    logger.warning("Star模块不可用，使用备用实现")
-    STAR_AVAILABLE = False
-    star_handlers_registry = []
-    star_map = {}
-    CommandFilter = None
-    CommandGroupFilter = None
-    RegexFilter = None
-    PermissionTypeFilter = None
-
-# 尝试导入EventType
-try:
-    from astrbot.core.star_handler import EventType
-except ImportError:
-    try:
-        from astrbot.core.star import EventType
-    except ImportError:
-        # 如果都失败了，定义一个临时的EventType
-        class EventType:
-            AdapterMessageEvent = "AdapterMessageEvent"
+AGENT_AVAILABLE = True
+STAR_AVAILABLE = True
 
 @register("command2llm", "vmoranv", "让大模型能够调用所有插件命令的插件", "1.0.0")
 class Command2LLMPlugin(Star):
@@ -123,7 +85,7 @@ class Command2LLMPlugin(Star):
             try:
                 umo = event.unified_msg_origin
                 provider_id = await self.context.get_current_chat_provider_id(umo=umo)
-            except:
+            except Exception:
                 return  # 无法获取提供商时跳过
             
             if not provider_id:
@@ -163,7 +125,7 @@ class Command2LLMPlugin(Star):
 
             # 调用Agent处理消息
             try:
-                llm_resp = await self.context.tool_loop_agent(
+                await self.context.tool_loop_agent(
                     event=event,
                     chat_provider_id=provider_id,
                     prompt=message_str,
@@ -173,7 +135,7 @@ class Command2LLMPlugin(Star):
                     tool_call_timeout=60
                 )
 
-                logger.info(f"Agent处理完成")
+                logger.info("Agent处理完成")
                 # 标记会话已调用过命令
                 self.session_command_used[session_id] = True
                 # 停止事件传播，避免重复处理
@@ -215,7 +177,7 @@ class Command2LLMPlugin(Star):
                 result = llm_resp.completion_text.strip()
                 logger.info(f"LLM判断结果: {result}")
                 return '是' in result
-            except:
+            except Exception:
                 return False
             
         except Exception as e:
@@ -461,7 +423,7 @@ class ExecuteCommandTool(FunctionTool[AstrAgentContext]):
                     sig = inspect.signature(OriginalEventClass.__init__)
                     if 'bot' in sig.parameters:
                         kwargs_event['bot'] = event.bot
-                        logger.debug(f"事件构造函数接受 'bot' 参数")
+                        logger.debug("事件构造函数接受 'bot' 参数")
                 except Exception as e:
                     logger.warning(f"无法检查事件构造函数签名: {e}")
                 
