@@ -1,6 +1,8 @@
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
+from astrbot.api.platform import AstrBotMessage, MessageMember
+from astrbot.api.message_components import Plain
 import asyncio
 import json
 import re
@@ -15,6 +17,7 @@ try:
     from astrbot.core.astr_agent_context import AstrAgentContext
     from pydantic import Field
     from pydantic.dataclasses import dataclass
+    from astrbot.core.config import AstrBotConfig
     AGENT_AVAILABLE = True
 except ImportError:
     logger.warning("Agent模块不可用，使用备用实现")
@@ -54,14 +57,18 @@ except ImportError:
 
 @register("command2llm", "vmoranv", "让大模型能够调用所有插件命令的插件", "1.0.0")
 class Command2LLMPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.config = config
         self.command_cache = {}
         self.cache_timeout = 300  # 缓存5分钟
         self.enabled = True  # 插件开关
         self.threshold = 0.6  # 命令匹配阈值
         self.last_messages = {}  # 存储用户最后的消息
-        self.processed_message_ids = set()  # 存储已处理的消息ID，避免重复处理
+        self.wake_word = config.get('wake_word', '/')  # 获取唤醒词，默认为/
+        self.session_command_used = {}  # 记录每个会话是否已调用过命令
+        logger.info(f"插件初始化完成，唤醒词设置为: {self.wake_word}")
+        
         
 
     async def initialize(self):
@@ -78,46 +85,35 @@ class Command2LLMPlugin(Star):
             if not self.enabled:
                 return
 
+            # 跳过bot自己发送的消息
+            if hasattr(event, 'message_obj') and event.message_obj and hasattr(event.message_obj, 'sender') and hasattr(event.message_obj.sender, 'user_id'):
+                if hasattr(event.message_obj, 'self_id') and event.message_obj.sender.user_id == event.message_obj.self_id:
+                    logger.info(f"跳过bot自己的消息: {event.message_str}")
+                    return
+
             message_str = event.message_str.strip()
             session_id = event.session_id
             
-            
+            # 检查本次会话是否已经调用过命令
+            if session_id in self.session_command_used:
+                logger.info(f"会话 {session_id} 已调用过命令，跳过处理")
+                event.stop_event()
+                return
             
             # 首先检查是否是我们伪造的事件（通过session_id标记）
-            if hasattr(event, 'session_id') and event.session_id.endswith("_cmd2llm"):
+            if hasattr(event, 'session_id') and event.session_id.endswith("_cmd2llm_fake"):
                 logger.info(f"跳过自己伪造的事件: {event.session_id}")
                 return
-            
-            # 获取消息ID进行检查
-            message_id = None
-            if hasattr(event, 'message_id'):
-                message_id = event.message_id
-            elif hasattr(event, 'message_obj') and hasattr(event.message_obj, 'message_id'):
-                message_id = event.message_obj.message_id
-            
-            # 检查是否已经处理过这个消息（避免处理自己伪造的事件）
-            if message_id and message_id in self.processed_message_ids:
-                logger.info(f"跳过已处理的消息ID: {message_id}")
-                return
 
-            # 标记此消息ID为已处理
-            if message_id:
-                self.processed_message_ids.add(message_id)
-                logger.info(f"标记消息ID为已处理: {message_id}")
-                # 清理过期的消息ID（保持集合大小合理）
-                if len(self.processed_message_ids) > 100:
-                    self.processed_message_ids.clear()
-
-            # 跳过命令消息（避免与现有命令冲突）
-            if message_str.startswith('/') or message_str.startswith('#') or message_str.startswith('!'):
-                # 存储最后一条消息（用于命令纠正）
-                if not message_str.startswith('!'):  # 不存储本插件的命令
-                    self.last_messages[session_id] = message_str
+            # 跳过所有命令消息（让命令直接执行，不拦截）
+            logger.info(f"检查消息: '{message_str}', 唤醒词: '{self.wake_word}'")
+            if message_str.startswith(self.wake_word) or message_str.startswith('#') or message_str.startswith('!'):
+                logger.info(f"跳过命令消息: {message_str}")
                 return
 
             # 跳过本插件的控制命令
             control_commands = ['ai_enable', 'ai_disable', 'ai_status', 'refresh_commands']
-            if any(message_str == f'!{cmd}' or message_str == cmd for cmd in control_commands):
+            if any(message_str == f'{self.wake_word}{cmd}' or message_str == cmd for cmd in control_commands):
                 return
 
             # 存储最后一条消息
@@ -133,50 +129,37 @@ class Command2LLMPlugin(Star):
             if not provider_id:
                 return  # 没有LLM提供商时跳过
 
-            # 检查消息是否需要调用命令
-            should_call = await self._should_call_command(event, provider_id)
-            logger.info(f"是否需要调用命令: {should_call}")
-            if not should_call:
+            # 检查本次会话是否已经调用过命令
+            if session_id in self.session_command_used:
+                logger.info(f"会话 {session_id} 已调用过命令，跳过处理")
+                event.stop_event()
                 return
 
-            # 检查agent模块是否可用
+            # 使用Agent工具执行命令
             if not AGENT_AVAILABLE:
                 logger.error("Agent模块不可用")
-                yield event.plain_result("抱歉，Agent模块不可用")
                 return
-
-            # 获取所有可用命令列表
-            commands_info = self._get_all_commands_info()
-            commands_list = []
-            for plugin_name, cmd_list in commands_info.items():
-                for cmd in cmd_list:
-                    command_name = cmd.split('#')[0].strip()
-                    if command_name:
-                        commands_list.append(command_name)
-            
-            # 添加调试日志
+                
+            commands_list = self._get_all_available_commands()
             logger.info(f"可用命令列表: {commands_list[:10]}...")  # 只显示前10个
-
-            # 构建系统提示，包含可用命令列表
-            system_prompt = f"""你是一个命令执行助手，只负责调用插件命令。
-
-可用命令列表：
-{chr(10).join(commands_list[:20])}  # 只显示前20个命令避免过长
-
-当用户需要执行某个命令时，请使用execute_command工具来执行命令。
-例如：用户说"帮我分析群聊"，你应该调用execute_command工具，参数为"群分析 7"
-如果用户问"今天吃什么"，而命令列表中有"今天吃什么"，你应该调用execute_command工具，参数为"今天吃什么"
-
-重要规则：
-1. 使用工具执行命令时，参数只需要命令名和参数，不需要加/前缀
-2. 确保命令在可用列表中
-3. 执行命令后不要回复任何内容，不要解释，不要建议，不要聊天
-4. 只执行命令，不进行任何对话"""
-
+            
             # 创建工具集合
             tools = ToolSet([
-                ExecuteCommandTool(self.context)
+                ExecuteCommandTool(self.context, self.wake_word)
             ])
+            
+            # 构建系统提示
+            system_prompt = f"""你是一个命令执行助手，负责根据用户消息选择合适的命令并执行。
+
+可用命令列表：
+{chr(10).join(commands_list)}
+
+重要规则：
+1. 根据用户消息选择合适的命令
+2. 使用execute_command工具执行命令，参数只需要命令名（不要/前缀）
+3. 执行命令后，工具会返回执行结果，请根据结果给用户一个简短的回复
+4. 如果用户消息不需要执行任何命令，直接回复用户
+5. 每次对话最多只执行一次命令"""
 
             # 调用Agent处理消息
             try:
@@ -186,16 +169,19 @@ class Command2LLMPlugin(Star):
                     prompt=message_str,
                     system_prompt=system_prompt,
                     tools=tools,
-                    max_steps=5,
+                    max_steps=2,  # 允许两步：执行命令 + 生成回复
                     tool_call_timeout=60
                 )
 
-                # 发送AI回复
-                logger.info(f"Agent回复: {llm_resp.completion_text}")
-                yield event.plain_result(llm_resp.completion_text)
+                logger.info(f"Agent处理完成")
+                # 标记会话已调用过命令
+                self.session_command_used[session_id] = True
+                # 停止事件传播，避免重复处理
+                event.stop_event()
+                return
             except Exception as e:
                 logger.error(f"Agent调用失败: {str(e)}")
-                yield event.plain_result("抱歉，我暂时无法处理您的请求。请稍后再试。")
+                return
                 
         except Exception as e:
             logger.error(f"消息处理错误: {str(e)}")
@@ -236,26 +222,26 @@ class Command2LLMPlugin(Star):
             logger.error(f"判断命令调用时出错: {str(e)}")
             return False
 
-    @filter.command("ai_enable", alias={"!ai_enable"})
+    @filter.command("ai_enable")
     async def ai_enable(self, event: AstrMessageEvent):
         """启用AI自动调用命令功能"""
         self.enabled = True
         yield event.plain_result("AI自动调用命令功能已启用")
 
-    @filter.command("ai_disable", alias={"!ai_disable"})
+    @filter.command("ai_disable")
     async def ai_disable(self, event: AstrMessageEvent):
         """禁用AI自动调用命令功能"""
         self.enabled = False
         yield event.plain_result("AI自动调用命令功能已禁用")
 
-    @filter.command("ai_status", alias={"!ai_status"})
+    @filter.command("ai_status")
     async def ai_status(self, event: AstrMessageEvent):
         """查看AI功能状态"""
         status = "启用" if self.enabled else "禁用"
         star_status = "可用" if STAR_AVAILABLE else "不可用"
-        yield event.plain_result(f"AI自动调用命令功能当前状态: {status}\nStar模块: {star_status}")
+        yield event.plain_result(f"AI自动调用命令功能当前状态: {status}\nStar模块: {star_status}\n唤醒词: {self.wake_word}")
 
-    @filter.command("refresh_commands", alias={"!refresh_commands"})
+    @filter.command("refresh_commands")
     async def refresh_commands(self, event: AstrMessageEvent):
         """刷新命令缓存"""
         self.command_cache.clear()
@@ -377,6 +363,8 @@ class Command2LLMPlugin(Star):
         
         return best_match
 
+    
+
     async def terminate(self):
         """插件销毁方法"""
         logger.info("Command2LLM插件已卸载")
@@ -385,8 +373,9 @@ class Command2LLMPlugin(Star):
 class ExecuteCommandTool(FunctionTool[AstrAgentContext]):
     """执行插件命令的工具"""
     
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, wake_word: str = "/"):
         self.context = context
+        self.wake_word = wake_word
         self.name = "execute_command"
         self.description = "执行指定的插件命令"
         self.parameters = {
@@ -409,9 +398,20 @@ class ExecuteCommandTool(FunctionTool[AstrAgentContext]):
             # 获取事件对象
             event = context.context.event
             
+            # 获取插件实例
+            plugin_instance = None
+            for star_metadata in self.context.get_all_stars():
+                if (hasattr(star_metadata, 'star_cls') and 
+                    isinstance(star_metadata.star_cls, Command2LLMPlugin)):
+                    plugin_instance = star_metadata.star_cls
+                    break
+            
+            if not plugin_instance:
+                return "无法获取插件实例"
+            
             # 通过框架执行命令
             try:
-                from astrbot.core.platform import platform
+                # 获取平台名称和适配器
                 platform_name = event.get_platform_name()
                 platform_obj = self.context.get_platform(platform_name)
                 
@@ -420,46 +420,58 @@ class ExecuteCommandTool(FunctionTool[AstrAgentContext]):
                     return "内部错误，无法确定平台"
                 
                 # 构造伪造的 AstrBotMessage
-                from astrbot.api.platform import AstrBotMessage
-                from astrbot.api.message_components import Plain
-                
                 fake_message = AstrBotMessage()
                 fake_message.type = event.message_obj.type if hasattr(event, 'message_obj') and event.message_obj else "text"
-                fake_message.message_str = f"/{command}"
-                fake_message.message = [Plain(text=f"/{command}")]
+                fake_message.message_str = f"{self.wake_word}{command}"
+                fake_message.message = [Plain(text=f"{self.wake_word}{command}")]
                 fake_message.self_id = event.message_obj.self_id if hasattr(event, 'message_obj') and event.message_obj else 0
-                fake_message.session_id = event.session_id + "_cmd2llm"
+                fake_message.session_id = event.session_id + "_cmd2llm_fake"
                 fake_message.message_id = str(uuid.uuid4())
                 
                 # 设置发送者信息
-                if hasattr(event, 'message_obj') and event.message_obj and hasattr(event.message_obj, 'sender'):
-                    fake_message.sender = event.message_obj.sender
+                if hasattr(event, 'message_obj') and event.message_obj:
+                    # 获取发送者信息
+                    sender_id = event.get_sender_id()
+                    sender_name = event.get_sender_name()
+                    if sender_id:
+                        fake_message.sender = MessageMember(user_id=sender_id, nickname=sender_name)
+                
+                # 设置raw_message
+                try:
+                    if hasattr(event, 'message_obj') and event.message_obj and hasattr(event.message_obj, 'raw_message'):
+                        fake_message.raw_message = event.message_obj.raw_message
+                    else:
+                        fake_message.raw_message = {}
+                except AttributeError:
+                    fake_message.raw_message = {}
                 
                 # 创建伪造事件
                 OriginalEventClass = event.__class__
                 
-                # 检查构造函数签名并准备参数
+                # 准备构造函数参数
                 kwargs_event = {
-                    "message_str": f"/{command}",
+                    "message_str": f"{self.wake_word}{command}",
                     "message_obj": fake_message,
                     "platform_meta": platform_obj.meta(),
                     "session_id": event.session_id,
                 }
                 
+                # 检查原始事件类的 __init__ 是否接受 'bot' 参数
                 try:
                     sig = inspect.signature(OriginalEventClass.__init__)
                     if 'bot' in sig.parameters:
                         kwargs_event['bot'] = event.bot
+                        logger.debug(f"事件构造函数接受 'bot' 参数")
                 except Exception as e:
                     logger.warning(f"无法检查事件构造函数签名: {e}")
                 
                 fake_event = OriginalEventClass(**kwargs_event)
                 
-                logger.info(f"通过工具执行命令: /{command}")
+                logger.info(f"通过工具执行命令: {self.wake_word}{command}")
                 platform_obj.commit_event(fake_event)
-                logger.info(f"命令 /{command} 已提交到框架执行")
+                logger.info(f"命令 {self.wake_word}{command} 已提交到框架执行，结果将直接显示给用户")
                 
-                return f"命令 '{command}' 已执行"
+                return ToolExecResult.success(f"命令 '{command}' 已执行，结果将显示在聊天中")
                 
             except Exception as e:
                 logger.error(f"执行命令时出错: {str(e)}")
