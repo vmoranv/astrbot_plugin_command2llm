@@ -40,7 +40,7 @@ class Command2LLMPlugin(Star):
         logger.info("Command2LLM插件初始化完成")
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def handle_message(self, event: AstrMessageEvent):
+    async def handle_message(self, event, *args, **kwargs):
         """拦截所有消息，判断是否需要调用命令"""
         try:
             # 检查插件是否启用
@@ -65,6 +65,15 @@ class Command2LLMPlugin(Star):
             # 首先检查是否是我们伪造的事件（通过session_id标记）
             if hasattr(event, 'session_id') and event.session_id.endswith("_cmd2llm_fake"):
                 logger.info(f"跳过自己伪造的事件: {event.session_id}")
+                event.stop_event()
+                return
+            
+            # 检查消息对象是否是我们伪造的
+            if (hasattr(event, 'message_obj') and event.message_obj and
+                hasattr(event.message_obj, 'session_id') and
+                event.message_obj.session_id.endswith("_cmd2llm_fake")):
+                logger.info(f"跳过自己伪造的消息对象: {event.message_obj.session_id}")
+                event.stop_event()
                 return
 
             # 跳过所有命令消息（让命令直接执行，不拦截）
@@ -95,6 +104,11 @@ class Command2LLMPlugin(Star):
             if session_id in self.session_command_used:
                 logger.info(f"会话 {session_id} 已调用过命令，跳过处理")
                 event.stop_event()
+                return
+
+            # 使用LLM判断是否需要调用命令
+            if not await self._should_call_command(event, provider_id):
+                logger.info(f"消息不需要调用命令: {message_str}")
                 return
 
             # 使用Agent工具执行命令
@@ -148,7 +162,7 @@ class Command2LLMPlugin(Star):
         except Exception as e:
             logger.error(f"消息处理错误: {str(e)}")
 
-    async def _should_call_command(self, event: AstrMessageEvent, provider_id: str) -> bool:
+    async def _should_call_command(self, event, provider_id) -> bool:
         """判断是否需要调用命令"""
         try:
             message_str = event.message_str.strip()
@@ -185,26 +199,26 @@ class Command2LLMPlugin(Star):
             return False
 
     @filter.command("ai_enable")
-    async def ai_enable(self, event: AstrMessageEvent):
+    async def ai_enable(self, event, *args, **kwargs):
         """启用AI自动调用命令功能"""
         self.enabled = True
         yield event.plain_result("AI自动调用命令功能已启用")
 
     @filter.command("ai_disable")
-    async def ai_disable(self, event: AstrMessageEvent):
+    async def ai_disable(self, event, *args, **kwargs):
         """禁用AI自动调用命令功能"""
         self.enabled = False
         yield event.plain_result("AI自动调用命令功能已禁用")
 
     @filter.command("ai_status")
-    async def ai_status(self, event: AstrMessageEvent):
+    async def ai_status(self, event, *args, **kwargs):
         """查看AI功能状态"""
         status = "启用" if self.enabled else "禁用"
         star_status = "可用" if STAR_AVAILABLE else "不可用"
         yield event.plain_result(f"AI自动调用命令功能当前状态: {status}\nStar模块: {star_status}\n唤醒词: {self.wake_word}")
 
     @filter.command("refresh_commands")
-    async def refresh_commands(self, event: AstrMessageEvent):
+    async def refresh_commands(self, event, *args, **kwargs):
         """刷新命令缓存"""
         self.command_cache.clear()
         yield event.plain_result("命令缓存已刷新")
@@ -387,7 +401,7 @@ class ExecuteCommandTool(FunctionTool[AstrAgentContext]):
                 fake_message.message_str = f"{self.wake_word}{command}"
                 fake_message.message = [Plain(text=f"{self.wake_word}{command}")]
                 fake_message.self_id = event.message_obj.self_id if hasattr(event, 'message_obj') and event.message_obj else 0
-                fake_message.session_id = event.session_id + "_cmd2llm_fake"
+                fake_message.session_id = f"{event.session_id}_cmd2llm_fake"
                 fake_message.message_id = str(uuid.uuid4())
                 
                 # 设置发送者信息
@@ -415,7 +429,7 @@ class ExecuteCommandTool(FunctionTool[AstrAgentContext]):
                     "message_str": f"{self.wake_word}{command}",
                     "message_obj": fake_message,
                     "platform_meta": platform_obj.meta(),
-                    "session_id": event.session_id,
+                    "session_id": fake_message.session_id,
                 }
                 
                 # 检查原始事件类的 __init__ 是否接受 'bot' 参数
