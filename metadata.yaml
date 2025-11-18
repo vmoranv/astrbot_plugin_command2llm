@@ -1,5 +1,5 @@
-name: command2llm # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
-display_name: Command2LLM # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
+name: astrbot_plugin_command2llm # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
+display_name: astrbot_plugin_command2llm # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
 desc: 让大模型能够调用所有插件命令的智能聊天插件。 # 插件简短描述
 version: v1.0.0 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: vmoranv # 作者
