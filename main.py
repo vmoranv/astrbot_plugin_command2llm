@@ -471,7 +471,7 @@ class ExecuteCommandTool(FunctionTool[AstrAgentContext]):
                 platform_obj.commit_event(fake_event)
                 logger.info(f"命令 {self.wake_word}{command} 已提交到框架执行，结果将直接显示给用户")
                 
-                return ToolExecResult.success(f"命令 '{command}' 已执行，结果将显示在聊天中")
+                return f"命令 '{command}' 已执行，结果将显示在聊天中"
                 
             except Exception as e:
                 logger.error(f"执行命令时出错: {str(e)}")
