@@ -26,6 +26,6 @@
         "description": "插件黑名单",
         "hint": "填写插件名称(区分大小写)，如：astrbot_plugin_help，黑名单中的插件不会参与命令发现与调用",
         "type": "list",
-        "default": []
+        "default": [astrbot_plugin_Heartflow, astrbot_plugin_debounce]
     }
 }
